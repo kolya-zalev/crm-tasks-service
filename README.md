@@ -1,99 +1,99 @@
-<p align="center">
-  <a href="http://nestjs.com/" target="blank"><img src="https://nestjs.com/img/logo-small.svg" width="120" alt="Nest Logo" /></a>
-</p>
+# crm-tasks-service
 
-[circleci-image]: https://img.shields.io/circleci/build/github/nestjs/nest/master?token=abc123def456
-[circleci-url]: https://circleci.com/gh/nestjs/nest
+Микросервис задач CRM: задачи по лидам (создание, изменение статуса, удаление,
+список всех задач и задач лида).
+Отвечает на вопрос «что и к какому сроку нужно сделать по лиду».
 
-  <p align="center">A progressive <a href="http://nodejs.org" target="_blank">Node.js</a> framework for building efficient and scalable server-side applications.</p>
-    <p align="center">
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/v/@nestjs/core.svg" alt="NPM Version" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/l/@nestjs/core.svg" alt="Package License" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/dm/@nestjs/common.svg" alt="NPM Downloads" /></a>
-<a href="https://circleci.com/gh/nestjs/nest" target="_blank"><img src="https://img.shields.io/circleci/build/github/nestjs/nest/master" alt="CircleCI" /></a>
-<a href="https://coveralls.io/github/nestjs/nest?branch=master" target="_blank"><img src="https://coveralls.io/repos/github/nestjs/nest/badge.svg?branch=master#9" alt="Coverage" /></a>
-<a href="https://discord.gg/G7Qnnhy" target="_blank"><img src="https://img.shields.io/badge/discord-online-brightgreen.svg" alt="Discord"/></a>
-<a href="https://opencollective.com/nest#backer" target="_blank"><img src="https://opencollective.com/nest/backers/badge.svg" alt="Backers on Open Collective" /></a>
-<a href="https://opencollective.com/nest#sponsor" target="_blank"><img src="https://opencollective.com/nest/sponsors/badge.svg" alt="Sponsors on Open Collective" /></a>
-  <a href="https://paypal.me/kamilmysliwiec" target="_blank"><img src="https://img.shields.io/badge/Donate-PayPal-ff3f59.svg" alt="Donate us"/></a>
-    <a href="https://opencollective.com/nest#sponsor"  target="_blank"><img src="https://img.shields.io/badge/Support%20us-Open%20Collective-41B883.svg" alt="Support us"></a>
-  <a href="https://twitter.com/nestframework" target="_blank"><img src="https://img.shields.io/twitter/follow/nestframework.svg?style=social&label=Follow" alt="Follow us on Twitter"></a>
-</p>
-  <!--[![Backers on Open Collective](https://opencollective.com/nest/backers/badge.svg)](https://opencollective.com/nest#backer)
-  [![Sponsors on Open Collective](https://opencollective.com/nest/sponsors/badge.svg)](https://opencollective.com/nest#sponsor)-->
+- транспорт: **RabbitMQ**, очередь **`tasks_queue`** (`@nestjs/microservices`), HTTP нет
+- база: **`tasks_db`** (PostgreSQL, TypeORM)
+- вызывается только из [crm-gateway](https://github.com/kolya-zalev/crm-gateway)
+- контракты: [@crm/shared](https://github.com/kolya-zalev/crm-shared) (`tasksMessages`, `TasksContract`, `TasksEvents`)
 
-## Description
+Раньше задачи жили внутри leads-service, в одной базе с лидами. Теперь у сервиса
+своя база, и о лидах он знает только `leadId`.
 
-[Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
+## Как связаны задачи и лиды
 
-## Project setup
+Лиды лежат в другой базе (`leads_db`), поэтому **внешнего ключа на лид нет**.
+Целостность поддерживают gateway и события:
 
-```bash
-$ npm install
+| Что | Кто отвечает |
+|---|---|
+| лид существует при создании задачи | gateway: сначала `leads.findOne`, если 404, задача не создаётся |
+| имя лида для уведомлений | gateway запрашивает его у leads-service |
+| задачи удалённого лида | событие **`lead.deleted`**: gateway отправляет его после удаления лида, сервис удаляет задачи |
+
+```
+создание:  gateway ──leads.findOne──▶ leads-service
+           gateway ──tasks.create───▶ tasks_queue ──▶ tasks-service ──▶ tasks_db
+удаление лида:
+           gateway ──leads.remove───▶ leads-service
+           gateway ──emit lead.deleted──▶ tasks_queue ──▶ tasks-service: удалить задачи лида
 ```
 
-## Compile and run the project
+**Цена разделения.** Раньше задачи удалялись каскадом в той же транзакции.
+Теперь это **итоговая согласованность**: если сервис выключен, задачи удалённого лида
+ещё существуют, пока он не поднимется. Событие при этом не теряется: очередь durable,
+сообщения persistent, оно дождётся сервиса в `tasks_queue`.
+
+## Сообщения
+
+| Тип | Паттерн | Payload | Ответ |
+|---|---|---|---|
+| запрос | `tasks.findAll` | `{}` | `TaskDto[]`, новые сверху |
+| запрос | `tasks.findByLead` | `{ leadId }` | `TaskDto[]` |
+| запрос | `tasks.create` | `{ leadId, data }` | созданное `TaskDto` (`status: pending`) |
+| запрос | `tasks.update` | `{ taskId, data }` | обновлённое `TaskDto` |
+| запрос | `tasks.remove` | `{ taskId }` | удалённое `TaskDto` (gateway берёт из него `leadId`) |
+| событие | `lead.deleted` | `{ leadId }` | ответа нет: удаляются все задачи лида |
+
+Ошибки (`NotFoundException`…) превращаются в RPC-ошибки с `statusCode`
+через `HttpToRpcExceptionFilter`. Если сервис не запущен, gateway через 5 секунд
+отвечает `503`. Ошибка в обработчике события пишется в лог.
+
+## Данные
+
+`Task`: `id` (uuid), `leadId` (индекс), `title`, `description`, `status` (`pending` / `completed`),
+`priority` (`low` / `medium` / `high`), `dueDate`, `createdAt`, `completedAt` (все даты `timestamptz`).
+
+Задачи перенесены из `leads_db` через
+`pg_dump --data-only --table='"Task"'`: имена таблицы и колонок сохранены, поэтому
+перенос прошёл одной командой.
+
+## Переменные окружения
+
+| Переменная | Пример |
+|---|---|
+| `TASKS_DATABASE_URL` | `postgresql://USER:PASSWORD@localhost:5432/tasks_db` |
+| `RABBIT_URL` | `amqp://USER:PASSWORD@localhost:5672` |
+
+## Локальный запуск
+
+Нужны PostgreSQL и RabbitMQ: проще всего поднять их из
+[crm-infra](https://github.com/kolya-zalev/crm-infra) (`docker compose up -d db rabbitmq`).
 
 ```bash
-# development
-$ npm run start
-
-# watch mode
-$ npm run start:dev
-
-# production mode
-$ npm run start:prod
+cp .env.example .env
+npm install
+npm run migration:run
+npm run start:dev
 ```
 
-## Run tests
+Проверка: в RabbitMQ UI (http://localhost:15672) у очереди `tasks_queue` → Consumers: 1.
+
+## Миграции
 
 ```bash
-# unit tests
-$ npm run test
-
-# e2e tests
-$ npm run test:e2e
-
-# test coverage
-$ npm run test:cov
+npm run migration:generate -- src/migrations/<Имя>   # по изменениям entity
+npm run migration:run                                # применить
+npm run migration:revert                             # откатить последнюю
 ```
 
-## Deployment
+`synchronize` выключен: схема меняется только миграциями.
 
-When you're ready to deploy your NestJS application to production, there are some key steps you can take to ensure it runs as efficiently as possible. Check out the [deployment documentation](https://docs.nestjs.com/deployment) for more information.
+## Docker
 
-If you are looking for a cloud-based platform to deploy your NestJS application, check out [Mau](https://mau.nestjs.com), our official platform for deploying NestJS applications on AWS. Mau makes deployment straightforward and fast, requiring just a few simple steps:
+`Dockerfile` → `npm ci` → `nest build`.
+`start.sh` → `typeorm migration:run -d dist/data-source.js` → `node dist/main`.
 
-```bash
-$ npm install -g mau
-$ mau deploy
-```
-
-With Mau, you can deploy your application in just a few clicks, allowing you to focus on building features rather than managing infrastructure.
-
-## Resources
-
-Check out a few resources that may come in handy when working with NestJS:
-
-- Visit the [NestJS Documentation](https://docs.nestjs.com) to learn more about the framework.
-- For questions and support, please visit our [Discord channel](https://discord.gg/G7Qnnhy).
-- To dive deeper and get more hands-on experience, check out our official video [courses](https://courses.nestjs.com/).
-- Deploy your application to AWS with the help of [NestJS Mau](https://mau.nestjs.com) in just a few clicks.
-- Visualize your application graph and interact with the NestJS application in real-time using [NestJS Devtools](https://devtools.nestjs.com).
-- Need help with your project (part-time to full-time)? Check out our official [enterprise support](https://enterprise.nestjs.com).
-- To stay in the loop and get updates, follow us on [X](https://x.com/nestframework) and [LinkedIn](https://linkedin.com/company/nestjs).
-- Looking for a job, or have a job to offer? Check out our official [Jobs board](https://jobs.nestjs.com).
-
-## Support
-
-Nest is an MIT-licensed open source project. It can grow thanks to the sponsors and support by the amazing backers. If you'd like to join them, please [read more here](https://docs.nestjs.com/support).
-
-## Stay in touch
-
-- Author - [Kamil Myśliwiec](https://twitter.com/kammysliwiec)
-- Website - [https://nestjs.com](https://nestjs.com/)
-- Twitter - [@nestframework](https://twitter.com/nestframework)
-
-## License
-
-Nest is [MIT licensed](https://github.com/nestjs/nest/blob/master/LICENSE).
+Запуск вместе с остальными: [crm-infra](https://github.com/kolya-zalev/crm-infra).
